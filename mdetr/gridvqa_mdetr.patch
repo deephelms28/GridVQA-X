@@ -1,0 +1,153 @@
+diff --git a/models/mdetr.py b/models/mdetr.py
+index 2a620ef..96b5a79 100644
+--- a/models/mdetr.py
++++ b/models/mdetr.py
+@@ -715,19 +715,28 @@ def build(args):
+ 
+     assert not args.masks or args.mask_model != "none"
+ 
++    # qa_dataset = None
++    # if args.do_qa:
++    #     assert not (
++    #         ("clevr" in args.combine_datasets or "clevr_question" in args.combine_datasets)
++    #         and "gqa" in args.combine_datasets
++    #     ), "training GQA and CLEVR simultaneously is not supported"
++    #     assert (
++    #         "clevr_question" in args.combine_datasets
++    #         or "clevr" in args.combine_datasets
++    #         or "gqa" in args.combine_datasets
++    #     ), "Question answering require either gqa or clevr dataset"
++    #     qa_dataset = "gqa" if "gqa" in args.combine_datasets else "clevr"
++    # ---- This is the CORRECTED block ----
+     qa_dataset = None
+     if args.do_qa:
+-        assert not (
+-            ("clevr" in args.combine_datasets or "clevr_question" in args.combine_datasets)
+-            and "gqa" in args.combine_datasets
+-        ), "training GQA and CLEVR simultaneously is not supported"
+-        assert (
+-            "clevr_question" in args.combine_datasets
+-            or "clevr" in args.combine_datasets
+-            or "gqa" in args.combine_datasets
+-        ), "Question answering require either gqa or clevr dataset"
+-        qa_dataset = "gqa" if "gqa" in args.combine_datasets else "clevr"
+-
++        # Use the qa_dataset attribute directly if it exists
++        if hasattr(args, 'qa_dataset') and args.qa_dataset in ["gqa", "clevr"]:
++            qa_dataset = args.qa_dataset
++        else:
++            # Fallback or error if qa_dataset isn't defined as expected
++            raise AttributeError("args.do_qa is True, but args.qa_dataset is not defined or invalid. Set it to 'gqa' or 'clevr'.")
++    # ---- End of CORRECTED block ----
+     backbone = build_backbone(args)
+ 
+     transformer = build_transformer(args)
+diff --git a/models/transformer.py b/models/transformer.py
+index fb1bc78..bc75b0f 100644
+--- a/models/transformer.py
++++ b/models/transformer.py
+@@ -92,7 +92,7 @@ class Transformer(nn.Module):
+             src = src.flatten(2).permute(2, 0, 1)
+             device = src.device
+             pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
+-            query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
++            query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1).clone()
+             mask = mask.flatten(1)
+ 
+             if self.CLS is not None:
+@@ -117,7 +117,9 @@ class Transformer(nn.Module):
+             device = src.device
+             if isinstance(text[0], str):
+                 # Encode the text
+-                tokenized = self.tokenizer.batch_encode_plus(text, padding="longest", return_tensors="pt").to(device)
++                tokenized = self.tokenizer(text, padding="longest", return_tensors="pt").to(device)
++                if 'token_type_ids' not in tokenized:
++                    tokenized['token_type_ids'] = torch.zeros_like(tokenized['attention_mask'])
+                 encoded_text = self.text_encoder(**tokenized)
+ 
+                 # Transpose memory because pytorch's attention expects sequence first
+@@ -131,6 +133,10 @@ class Transformer(nn.Module):
+                 # The text is already encoded, use as is.
+                 text_attention_mask, text_memory_resized, tokenized = text
+ 
++            # Save pre-fusion image features (before encoder cross-attention)
++            # src at this point is [CLS, spatial_HW] with shape (1+HW, B, 256)
++            img_src_pre_fusion = src.clone()
++
+             # Concat on the sequence dimension
+             src = torch.cat([src, text_memory_resized], dim=0)
+             # For mask, sequence dimension is second
+@@ -149,6 +155,7 @@ class Transformer(nn.Module):
+                 "img_memory": img_memory,
+                 "text_pooled_op": encoded_text.pooler_output if self.CLS is not None else None,
+                 "img_pooled_op": img_memory[0] if self.CLS is not None else None,  # Return the CLS token
++                "img_src_pre_fusion": img_src_pre_fusion,  # (1+HW, B, 256) before encoder
+                 "mask": mask,
+                 "text_attention_mask": text_attention_mask,
+                 "pos_embed": pos_embed,
+@@ -325,7 +332,7 @@ class TransformerDecoderLayer(nn.Module):
+         super().__init__()
+         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+         self.cross_attn_image = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+-        # self.cross_attn_text = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
++        self.cross_attn_text = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+ 
+         # Implementation of Feedforward model
+         self.linear1 = nn.Linear(d_model, dim_feedforward)
+@@ -333,11 +340,11 @@ class TransformerDecoderLayer(nn.Module):
+         self.linear2 = nn.Linear(dim_feedforward, d_model)
+ 
+         self.norm1 = nn.LayerNorm(d_model)
+-        # self.norm2 = nn.LayerNorm(d_model)
++        self.norm2 = nn.LayerNorm(d_model)
+         self.norm3 = nn.LayerNorm(d_model)
+         self.norm4 = nn.LayerNorm(d_model)
+         self.dropout1 = nn.Dropout(dropout)
+-        # self.dropout2 = nn.Dropout(dropout)
++        self.dropout2 = nn.Dropout(dropout)
+         self.dropout3 = nn.Dropout(dropout)
+         self.dropout4 = nn.Dropout(dropout)
+ 
+@@ -369,15 +376,15 @@ class TransformerDecoderLayer(nn.Module):
+         tgt = self.norm1(tgt)
+ 
+         # Cross attention to text
+-        # tgt2 = self.cross_attn_text(
+-        #     query=self.with_pos_embed(tgt, query_pos),
+-        #     key=text_memory,
+-        #     value=text_memory,
+-        #     attn_mask=None,
+-        #     key_padding_mask=text_memory_key_padding_mask,
+-        # )[0]
+-        # tgt = tgt + self.dropout2(tgt2)
+-        # tgt = self.norm2(tgt)
++        tgt2 = self.cross_attn_text(
++            query=self.with_pos_embed(tgt, query_pos),
++            key=text_memory,
++            value=text_memory,
++            attn_mask=None,
++            key_padding_mask=text_memory_key_padding_mask,
++        )[0]
++        tgt = tgt + self.dropout2(tgt2)
++        tgt = self.norm2(tgt)
+ 
+         # Cross attention to image
+         tgt2 = self.cross_attn_image(
+diff --git a/util/box_ops.py b/util/box_ops.py
+index a3ad5e8..2333c4d 100644
+--- a/util/box_ops.py
++++ b/util/box_ops.py
+@@ -7,8 +7,13 @@ import torch
+ from torchvision.ops.boxes import box_area
+ 
+ 
++# This is the new, robust version
++
+ def box_cxcywh_to_xyxy(x):
+     x_c, y_c, w, h = x.unbind(-1)
++    # Add a clamp to prevent negative widths and heights, which cause the assertion to fail
++    w = w.clamp(min=0)
++    h = h.clamp(min=0)
+     b = [(x_c - 0.5 * w), (y_c - 0.5 * h), (x_c + 0.5 * w), (y_c + 0.5 * h)]
+     return torch.stack(b, dim=-1)
+ 

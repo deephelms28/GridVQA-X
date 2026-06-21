@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+.conda/
+
+# Generated datasets / images
+*.jpg
+*.jpeg
+images/
+GridVQA/
+GridVQA_SP/
+
+# Model checkpoints & large artifacts
+*.pth
+*.pt
+*.ckpt
+checkpoints*/
+
+# Experiment tracking / logs
+wandb/
+logs/
+*.log
+
+# Outputs
+*.json
+!**/configs/*.json
+eval_output/
+*_results/
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
